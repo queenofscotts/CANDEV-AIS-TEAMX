@@ -1,0 +1,370 @@
+Team X - PLAN for the data 
+Our team found many issues and inefficiencies in this code, so decided the best approach would be to redesign the cleaning process.
+We decided to use the pre-cleaned data to show you how the functions that we propose will work. 
+The following documentation is based on the R-codes provided by your team. 
+Our concept would streamline this process and dump daily data into the cloud. 
+https://app.powerbi.com/view?r=eyJrIjoiOTFjZGU1NmYtNDU3Ny00MDYxLWE3MWQtNzk3NjI0MGIzMTg4IiwidCI6IjZhZDkxODk1LWRlMDYtNDg1ZS1iYzUxLWZjZTEyNmNjODUzMCIsImMiOjN9
+
+
+
+Pre-Processing Canadian Coast Guard (CCG) Data
+1.	Open file: Run_ConsolidateToDaily_Example.R 
+2.	Modify this script to specify directories for:
+o	custom r functions
+o	target files of interest to be decoded
+▪	should be directly downloaded (i.e. not streamed) data
+o	outfiles to be created
+3.	Run the script
+-	This script uses:
+o	custom R functions: 
+▪	ConsolidateToDaily
+●	consolidates raw .rx AIS files to daily .csv files 
+●	reformats data to work with downstream decoding functions 
+●	Only reads in files for the message types of interest to us: 
+o	Slow logs: 5, 19, 24
+o	Quick logs: 1, 2, 3, 18, 19
+o	Aid to Navigation: 21 
+▪	Clean_DirectAISData
+●	removes data with several types of errors and unwanted data types
+▪	JoinSplitLines_DirectAISData
+●	rejoin rows of data that have been split across two rows 
+▪	datetimecheck
+●	checks for errors in date/time 
+●	does not make any alterations to the data, just reports any discrepancy
+●	optional; can be omitted to save time (relatively time consuming)
+o	R package: stringr 
+
+
+Decoding Terrestrial Data 
+From Canadian Coast Guard (CCG)
+Steps:
+1.	Open file: CCG_AIS_Processsing_Start.R 
+2.	Modify this script to specify directories for:
+o	custom r functions
+o	target files of interest to be decoded
+▪	files must first be consolidated to daily .csv files (see section above) 
+o	outfiles to be created
+▪	outfile directory must contain sub-directories called:
+●	Dynamic_Data
+●	Static_Data
+●	AtoN_Data
+3.	Run the appropriate section of the script
+Required functions/packages:
+-	In addition to the functions that are common to all decoders, this script uses:
+o	custom R functions: 
+▪	Process_Raw_CCG_Region
+●	main function, within which the others are nested
+●	sets up header information (e.g. station and time)
+●	split data up by region, and process each separately
+●	write outfiles
+▪	JoinSplitAISlines
+●	fixes rows of data where start of one row is joined to end of another
+▪	Process_Multi_Types
+●	runs several custom functions on all data types 
+▪	Combine_Sentences
+▪	Slowlog_Processing
+●	sets up static data for translation
+▪	Type21_Processsing
+●	sets up message type 21 (aids to navigation) for translation 
+▪	AIS_Translation_Type21
+o	R package: 
+▪	compositions  
+
+
+#################################################################################
+## 1: loop through files                                                ##
+#################################################################################
+
+require(stringr) # only used for reporting name of file processed
+
+# Set-up list of infiles
+	
+indir <- "E:/AIS_Data/DailyFiles/CCG_AIS_DailyFiles_2017"    # directory where infiles are located
+patt <- "2017-07"               # pattern to match/find in file names, e.g. 2017-07" to specify all files from July 2017
+	
+filelist <- list.files(path = indir, pattern = patt)  
+infiles <- file.path(indir, filelist)	
+	
+# set outfile directory
+# must contain sub-directories: "Dynamic_Data", "Static_Data", "AtoN_Data"
+
+outdir <- "E:/AIS_Data/Decoded/"  # trailing '/' is required
+
+
+# Run decoder	
+	
+for(infile in infiles){
+
+	  Process_Raw_CCG_Region(infile, outdir)
+    print(paste("Done file:", str_sub(infile, -26,-1), sep = " "))
+
+}
+
+
+Process_Raw_CCG_Region<- function(infile, outdir){
+
+
+Tdata <- read.csv(infile,header = FALSE, stringsAsFactors=FALSE)
+
+unwanted <- which((Tdata$V1 == "!AIVDO") | (Tdata$V1 == "!ABVDO") | (Tdata$V1 == "!ABVDM"  ))
+
+if(length(unwanted)>0){
+  Tdata <- Tdata[-unwanted,]   # get rid of rows that are missing station info and that aren't of type '!AIVDM' (if any)
+}
+
+
+if(length(which(Tdata$V1 == "!AIVDM")) > 0){     # If any rows are missing information, run function to correct format 
+  Tdata<-Replace_Missing_Station_Info(Tdata) 
+}
+
+Tdata <- JoinSplitAISlines(Tdata)   # fixes rows of data where the start of one row is joined to the end of another (if any)
+
+n = 6 
+
+# sets up a new column of '!AIVDO', '!AIVDM', etc
+
+Tdata$V10<-substr(as.character(Tdata$V3),               # within this character string
+                  (nchar(as.character(Tdata$V3))+1)-n,  # start
+                  nchar(as.character(Tdata$V3))         # end
+                  )
+
+ind <- which(Tdata$V10 == "!AIVDM")
+AISdata <-Tdata[ind,]                 # saves as AISdata only the data that is !AIVDM
+
+
+##########################################################
+Datecheck <- substr(infile,nchar(infile)-13,nchar(infile)-4)  # extract date from file name: from start of date to before '.csv'
+
+# AISdata$V4 - number of sentences	# AISdata$V5  - Sentence Number
+# AISdata$V6
+# AIS data$V7  - The AIS channel - A or B
+
+###############  Need to get rid of the data that doesn't have the reciever station information  ##########
+AISdata<-AISdata[!is.na(AISdata$V4),]
+
+
+############################  Remove bad data that I have detected so far ###############
+
+AISdata<-subset(AISdata,grepl("\\*",AISdata$V9))   # keep rows with a * in this column
+AISdata<-subset(AISdata,grepl("\\*", AISdata$V3))  # keep rows with a * in this column
+AISdata<-subset(AISdata,grepl(":", AISdata$V1))    # keep rows with a : in this column
+
+
+#######################################################################################
+
+## Quick reference of what these functions use/do
+# gsub(pattern, replacement, x)
+# substr(x, start, stop)
+# strsplit(x, split)
+#  ^ matchs the empty string at the beginning
+
+AISdata$Station_Time<- gsub("\\\\c:","", AISdata$V1)      # replace "\c:" with nothing ("") in V1; assign as station time
+AISdata$V11<- gsub("^s:","", AISdata$V3)                  # removes "s:" from start of V3
+AISdata$Region<-substr(AISdata$V11,1,1)                   # first character of V11 as region
+
+
+AISdata$V12<-strsplit(AISdata$V11,"-")                    # split V11 to get data other than region in a seperate string         
+check_Station1<-which(lengths(AISdata$V12)== 1)
+check_Station3<-which(lengths(AISdata$V12)== 3)
+
+if (length(check_Station1)>0) {
+AISdata$V11[check_Station1]<-("U-Unknown*99\\!AIVDM")
+AISdata$V12[check_Station1]<-strsplit(AISdata$V11[check_Station1],"-") 
+}
+
+
+if (length(check_Station3)>0) {
+AISdata$V11[check_Station3]<-("U-Unknown*99\\!AIVDM")
+AISdata$V12[check_Station3]<-strsplit(AISdata$V11[check_Station3],"-") 
+}
+
+
+# unique(lengths(AISdata$V12))  # THis is the commands to find the issues with splitting the data only needed when error checking so that it can be fixed above
+# t<- which(lengths(AISdata$V12)== 3)
+AISdata$Slot_Num<-gsub("C:","", AISdata$V2)
+
+
+#AISdata<-na.omit(AISdata)   # removes rows with NAs
+
+tmat  <- matrix(unlist(AISdata$V12), ncol=2, byrow=TRUE)
+tmat2<-as.character(tmat[,2])                             # AIS data other than region in a seperate string 
+
+tmat3<-strsplit(tmat2,"\\*")                              # split AIS data other than region at * 
+check_split<-which(lengths(tmat3)==3)
+
+ if (length(check_split)>0) {
+tmat2[check_split]<-"Unknown*99\\AIVDM"
+tmat3[check_split]<-strsplit(tmat2[check_split],"\\*") 
+}     
+
+
+tmat4<-matrix(unlist(tmat3),ncol = 2, byrow = TRUE)
+Station_Location<-as.character(tmat4[,1])                 # keep pre-* data as station location
+AISdata<-cbind(AISdata, Station_Location)
+
+
+AISdata<-subset(AISdata, select=c(Region, Station_Location, Station_Time, Slot_Num, V4, V5, V6, V7, V8, V9, V10))
+colnames(AISdata)[5] <- "Num_Sentences"
+colnames(AISdata)[6] <- "Sentence_Number"
+colnames(AISdata)[8]<- "AIS_Channel"
+colnames(AISdata)[9]<-"NMEA_Message"
+
+
+# as.POSIX* functions convert an object to classes used to represent date/times
+# thus section uses station time to make columns for year, month, day, hour, minute and second
+# also and removes any rows with NAs
+
+AISdata$GMT_Time<-(as.POSIXlt(as.numeric(AISdata$Station_Time),origin="1970-01-01",tz="GMT"))  # This works, but right now there is data that is missing the reciever information so there is a problem and it produces NAs.\
+AISdata<-AISdata[!is.na(AISdata$GMT_Time),]
+AISdata$year <-as.numeric(substr(AISdata$GMT_Time,1,4))
+AISdata$month <-as.numeric(substr(AISdata$GMT_Time,6,7))
+AISdata$day <-as.numeric(substr(AISdata$GMT_Time,9,11))
+AISdata$hour <-as.numeric(substr(AISdata$GMT_Time,12,13))
+AISdata$minute <-as.numeric(substr(AISdata$GMT_Time,15,16))
+AISdata$second<-as.numeric(substr(AISdata$GMT_Time,18,19))
+AISdata<-AISdata[!is.na(AISdata$month),]
+AISdata<-AISdata[!is.na(AISdata$day),]
+AISdata<-AISdata[!is.na(AISdata$hour),]
+AISdata<-AISdata[!is.na(AISdata$minute),]
+AISdata<-AISdata[!is.na(AISdata$second),]
+
+AISdata$TimeZone<-"GMT"
+
+AISdata$ID<-seq(1:nrow(AISdata))
+
+################################################### Date Check ####################################
+
+# make sure date on file name matches date determined for each row
+# only keep rows where this data matches/is correct
+
+checkyear <-as.numeric(substr(Datecheck,1,4))
+checkmonth<-as.numeric(substr(Datecheck,6,7))
+checkday<-as.numeric(substr(Datecheck, 9,11))
+
+yrind<- which(AISdata$year == checkyear)
+AISdata<-AISdata[yrind,]
+
+monind<-which(AISdata$month == checkmonth)
+AISdata<- AISdata[monind,]
+
+dayind<-which(AISdata$day == checkday)
+AISdata<-AISdata[dayind,]
+
+AISdata<-AISdata[!is.na(AISdata$Station_Time),]
+
+
+############################################################ Regions ########################################
+Regions<-c("P", "Q", "N","C","M", "G", "U")
+
+Pacific_AISdata<-subset(AISdata, AISdata$Region == "P")
+Quebec_AISdata<-subset(AISdata,AISdata$Region == "Q")
+Central_AISdata<-subset(AISdata,AISdata$Region == "C")
+Newfoundland_AISdata<-subset(AISdata,AISdata$Region == "N")
+Maritime_AISdata<-subset(AISdata,AISdata$Region == "M")
+Gulf_AISdata<-subset(AISdata,AISdata$Region == "G")
+Unknown_AISdata<-subset(AISdata, AISdata$Region == "U")
+
+
+if (nrow(Pacific_AISdata)>0) {
+	Pacific_AISdata2<-Process_Multi_Types(Pacific_AISdata)
+	Pacific_Quicklog<- Quicklog_Processsing(Pacific_AISdata2)
+	Pacific_Slowlog<- Slowlog_Processsing(Pacific_AISdata2)
+	Pacific_AtoN<- Type21_Processsing(Pacific_AISdata2)
+}
+
+if (nrow(Quebec_AISdata)>0) {
+	Quebec_AISdata2<-Process_Multi_Types(Quebec_AISdata)
+	Quebec_Quicklog<- Quicklog_Processsing(Quebec_AISdata2)
+	Quebec_Slowlog<- Slowlog_Processsing(Quebec_AISdata2)
+	Quebec_AtoN<- Type21_Processsing(Quebec_AISdata2)
+}
+
+if (nrow(Central_AISdata)>0) {
+	Central_AISdata2<-Process_Multi_Types(Central_AISdata)
+	Central_Quicklog<- Quicklog_Processsing(Central_AISdata2)
+	Central_Slowlog<- Slowlog_Processsing(Central_AISdata2)
+	Central_AtoN<- Type21_Processsing(Central_AISdata2)
+}
+
+if (nrow(Newfoundland_AISdata)>0) {
+	Newfoundland_AISdata2<-Process_Multi_Types(Newfoundland_AISdata)
+	Newfoundland_Quicklog<- Quicklog_Processsing(Newfoundland_AISdata2)
+	Newfoundland_Slowlog<- Slowlog_Processsing(Newfoundland_AISdata2)
+	Newfoundland_AtoN<- Type21_Processsing(Newfoundland_AISdata2)
+}
+
+if (nrow(Maritime_AISdata)>0) {
+	Maritime_AISdata2<-Process_Multi_Types(Maritime_AISdata)
+	Maritime_Quicklog<- Quicklog_Processsing(Maritime_AISdata2)
+	Maritime_Slowlog<- Slowlog_Processsing(Maritime_AISdata2)
+	Maritime_AtoN<- Type21_Processsing(Maritime_AISdata2)
+}
+
+if (nrow(Gulf_AISdata)>0) {
+  Gulf_AISdata2<-Process_Multi_Types(Gulf_AISdata)
+  Gulf_Quicklog<- Quicklog_Processsing(Gulf_AISdata2)
+  Gulf_Slowlog<- Slowlog_Processsing(Gulf_AISdata2)
+  Gulf_AtoN<- Type21_Processsing(Gulf_AISdata2)
+}
+
+if (nrow(Unknown_AISdata)>0) {
+	Unknown_AISdata2<-Process_Multi_Types(Unknown_AISdata)
+	Unknown_Quicklog<- Quicklog_Processsing(Unknown_AISdata2)
+	Unknown_Slowlog<- Slowlog_Processsing(Unknown_AISdata2)
+	Unknown_AtoN<- Type21_Processsing(Unknown_AISdata2)
+}
+######################################################################################################################
+
+
+CCG_AIS_Quicklog<-rbind(if(exists("Pacific_Quicklog")) Pacific_Quicklog, 
+	if(exists("Quebec_Quicklog")) Quebec_Quicklog,
+ if(exists("Central_Quicklog")) Central_Quicklog,
+ if(exists("Newfoundland_Quicklog")) Newfoundland_Quicklog,
+ if(exists("Maritime_Quicklog")) Maritime_Quicklog,
+ if(exists("Gulf_Quicklog")) Gulf_Quicklog,
+ if(exists("Unknown_Quicklog")) Unknown_Quicklog)
+
+######################################################################################################################
+
+#	Bin_lookup<- read.table('/users/angeliavanderlaan/Desktop/AIS_Processing/R_Decoder/Bin2Ascii64.txt', header = TRUE, colClasses=c(Bin = "character", Dec = "numeric", Decn= "numeric", ASCII = "character"), )
+#	Bin_lookup<- read.table('/home/angelia/Documents/MPAs/Traffic/Processing/R_Decoder/Bin2Ascii64.txt', header = TRUE, colClasses=c(Bin = "character", Dec = "numeric", Decn= "numeric", ASCII = "character"), )
+
+CCG_AIS_Slowlog<-rbind(if(exists("Pacific_Slowlog")) Pacific_Slowlog, 
+	if(exists("Quebec_Slowlog")) Quebec_Slowlog,
+ if(exists("Central_Slowlog")) Central_Slowlog,
+ if(exists("Newfoundland_Slowlog")) Newfoundland_Slowlog,
+ if(exists("Maritime_Slowlog")) Maritime_Slowlog,
+ if(exists("Gulf_Slowlog")) Gulf_Slowlog,
+  if(exists("Unknown_Slowlog")) Unknown_Slowlog)
+######################################################################################################################
+
+# Aid to navigation (Message type 21)
+
+CCG_AIS_AtoN<-rbind(if(exists("Pacific_AtoN")) Pacific_AtoN, 
+                        if(exists("Quebec_AtoN")) Quebec_AtoN,
+                        if(exists("Central_AtoN")) Central_AtoN,
+                        if(exists("Newfoundland_AtoN")) Newfoundland_AtoN,
+                        if(exists("Maritime_AtoN")) Maritime_AtoN,
+                        if(exists("Gulf_AtoN")) Gulf_AtoN,
+                        if(exists("Unknown_AtoN")) Unknown_AtoN)
+
+###############################################################################################################################
+
+
+####################################################################################
+
+outfile1 <- file.path(paste(outdir,"Dynamic_Data", sep=""), c(paste("CCG_AIS_Dynamic_Data_",  Datecheck, ".csv",sep="")))
+outfile2 <- file.path(paste(outdir,"Static_Data", sep=""), c(paste("CCG_AIS_Static_Data_",  Datecheck, ".csv",sep="")))
+outfile3 <- file.path(paste(outdir,"AtoN_Data", sep=""), c(paste("CCG_AIS_AtoN_Data_",  Datecheck, ".csv",sep="")))
+
+
+write.csv(CCG_AIS_Quicklog, file = outfile1, row.names=FALSE)
+write.csv(CCG_AIS_Slowlog, file = outfile2, row.names=FALSE)
+write.csv(CCG_AIS_AtoN, file = outfile3, row.names=FALSE)
+
+
+unique(AISdata$Region)
+alarm()
+}
+
+
